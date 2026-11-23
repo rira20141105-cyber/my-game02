@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>My Adventure Game</title>
+<style>
+  * { box-sizing: border-box; user-select: none; -webkit-user-select: none; }
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  body { display: flex; justify-content: center; align-items: center; font-family: sans-serif; }
+  #game-container { position: relative; width: min(100vw, 100vh); height: min(100vh, 100vw); background: #111; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; touch-action: none; }
+  #loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#eee; font-size:16px; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="game-container">
+  <canvas id="gameCanvas" width="1000" height="1000" aria-label="探索ゲーム"></canvas>
+  <div id="loading">画像を読み込み中…</div>
+</div>
+<script>
+'use strict';
+
+const CONFIG = {
+  moveSpeed: 5,
+  // true にすると、ゲーム開始時に約2秒の帰宅演出を入れます。
+  entranceAnimation: true,
+  entranceDuration: 2000,
+  openingMessages: ["（バイトしてたらもう夜中の1時…）", "（眠い…）"],
+  leftDoorMessages: ["（他の人の部屋だ…）"],
+  centerDoorMessages: ["（空き部屋だ。特に用がないな…）"],
+  rightDoorMessages: ["（…自分の部屋）"],
+  roomQuestion: "『部屋に入る？』",
+  choiceYesText: "入る",
+  choiceNoText: "入らない",
+  choiceReturnDelay: 350,
+  images: {
+    bg1: "bg.PNG", bg2: "bg2.PNG", bg3: "bg3.PNG", frame: "frame.PNG",
+    charaIdle: "chara_idle.PNG", charaWalk1: "chara_walk1.PNG", charaWalk2: "chara_walk2.PNG",
+    padNeutral: "pad_neutral.PNG", padUp: "pad_up.PNG", padDown: "pad_down.PNG", padRight: "pad_right.PNG", padLeft: "pad_left.PNG",
+    arrowNeutral: "arrow_neutral.PNG", arrowCenter: "arrow_center.PNG", arrowLeft: "arrow_left.PNG", arrowRight: "arrow_right.PNG",
+    window: "window.PNG", choiceBox: "choice_box.PNG", tachie: "tachie.PNG"
+  }
+};
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const loading = document.getElementById('loading');
+const imgs = {};
+let loadedCount = 0;
+let failedImages = [];
+const imageKeys = Object.keys(CONFIG.images);
+
+function loadImage(key, filename) {
+  const img = new Image();
+  img.onload = () => { loadedCount++; updateLoading(); };
+  img.onerror = () => {
+    // 拡張子の大文字・小文字違いにも対応
+    if (img.src.endsWith('.PNG')) {
+      img.src = filename.replace('.PNG', '.png');
+    } else {
+      failedImages.push(filename);
+      loadedCount++;
+      updateLoading();
+    }
+  };
+  img.src = filename;
+  imgs[key] = img;
+}
+function updateLoading() {
+  if (loadedCount >= imageKeys.length) {
+    loading.style.display = 'none';
+    if (failedImages.length) {
+      console.warn('読み込めなかった画像:', failedImages.join(', '));
+    }
+  }
+}
+for (const key of imageKeys) loadImage(key, CONFIG.images[key]);
+
+const state = {
+  mode: CONFIG.entranceAnimation ? 'entrance' : 'message',
+  playerX: 0,
+  playerY: CONFIG.entranceAnimation ? -430 : -260,
+  entranceStart: 0,
+  dir: 'neutral',
+  walkFrame: 0,
+  walkTimer: 0,
+  arrowsVisible: false,
+  highlightedDoor: null,
+  msgQueue: CONFIG.openingMessages.slice(),
+  msgIndex: 0,
+  currentDoorEvent: null,
+  selectedChoice: 0,
+  fadeAlpha: 0,
+  choiceReturnAt: 0
+};
+
+const BOUNDS = { minX: -400, maxX: 400, minY: -270, maxY: 55 };
+const CAMERA_THRESHOLD = { step2Y: -60, step3Y: 15 };
+const PAD = { centerX: 185, centerY: 705, radius: 135 };
+
+function imageReady(img) { return !!img && img.complete && img.naturalWidth > 0; }
+function drawImage(key, x=0, y=0, w=1000, h=1000) {
+  if (imageReady(imgs[key])) ctx.drawImage(imgs[key], x, y, w, h);
+}
+function checkRoomArea() {
+  if (state.playerY >= CAMERA_THRESHOLD.step3Y) state.arrowsVisible = true;
+  else { state.arrowsVisible = false; state.highlightedDoor = null; }
+}
+function getCanvasCoords(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  return { x: ((clientX - rect.left) / rect.width) * 1000, y: ((clientY - rect.top) / rect.height) * 1000 };
+}
+function updatePadDirection(x, y) {
+  const dx = x - PAD.centerX, dy = y - PAD.centerY;
+  if (Math.abs(dx) < PAD.radius && Math.abs(dy) < PAD.radius) {
+    state.dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    return true;
+  }
+  return false;
+}
+function checkArrowTap(x, y) {
+  if (!state.arrowsVisible) return null;
+  // 画面下部に並ぶ3つの部屋選択エリア
+  if (y >= 660 && y <= 850) {
+    if (x >= 255 && x <= 415) return 'left';
+    if (x >= 416 && x <= 625) return 'center';
+    if (x >= 626 && x <= 880) return 'right';
+  }
+  return null;
+}
+function startDoorEvent(door) {
+  state.dir = 'neutral';
+  state.currentDoorEvent = door;
+  state.msgIndex = 0;
+  state.mode = 'message';
+  if (door === 'left') state.msgQueue = CONFIG.leftDoorMessages.slice();
+  else if (door === 'center') state.msgQueue = CONFIG.centerDoorMessages.slice();
+  else state.msgQueue = CONFIG.rightDoorMessages.slice();
+}
+function finishMessage() {
+  if (state.msgIndex < state.msgQueue.length - 1) {
+    state.msgIndex++;
+    return;
+  }
+  if (state.currentDoorEvent === 'right') {
+    state.mode = 'choice';
+    state.selectedChoice = -1;
+  } else {
+    state.mode = 'walk';
+    state.currentDoorEvent = null;
+    state.highlightedDoor = null;
+  }
+}
+function chooseRoomOption(option) {
+  state.selectedChoice = option;
+  if (option === 0) {
+    state.mode = 'fadeout';
+    state.dir = 'neutral';
+  } else {
+    state.choiceReturnAt = performance.now() + CONFIG.choiceReturnDelay;
+    state.mode = 'choiceReturn';
+  }
+}
+function handlePointerDown(clientX, clientY) {
+  const {x, y} = getCanvasCoords(clientX, clientY);
+  if (state.mode === 'message') { finishMessage(); return; }
+  if (state.mode === 'choice') {
+    if (x >= 250 && x <= 750 && y >= 200 && y <= 325) chooseRoomOption(0);
+    else if (x >= 250 && x <= 750 && y >= 326 && y <= 450) chooseRoomOption(1);
+    return;
+  }
+  if (state.mode === 'walk') {
+    const door = checkArrowTap(x, y);
+    if (door) { state.highlightedDoor = door; startDoorEvent(door); return; }
+    updatePadDirection(x, y);
+  }
+}
+function handlePointerMove(clientX, clientY) {
+  if (state.mode === 'walk' && state.dir !== 'neutral') {
+    const {x, y} = getCanvasCoords(clientX, clientY);
+    if (!updatePadDirection(x, y)) state.dir = 'neutral';
+  }
+}
+function handlePointerUp() { state.dir = 'neutral'; }
+
+canvas.addEventListener('pointerdown', e => { e.preventDefault(); canvas.setPointerCapture?.(e.pointerId); handlePointerDown(e.clientX, e.clientY); });
+canvas.addEventListener('pointermove', e => { if (e.buttons || e.pointerType === 'touch') handlePointerMove(e.clientX, e.clientY); });
+canvas.addEventListener('pointerup', e => { e.preventDefault(); handlePointerUp(); });
+canvas.addEventListener('pointercancel', handlePointerUp);
+
+function update(now) {
+  if (state.mode === 'entrance') {
+    if (!state.entranceStart) state.entranceStart = now;
+    const t = Math.min(1, (now - state.entranceStart) / CONFIG.entranceDuration);
+    // 帰宅して画面内の初期位置に歩いてくる演出
+    state.playerY = -430 + 170 * t;
+    state.walkFrame = Math.floor(now / 140) % 2 + 1;
+    if (t >= 1) {
+      state.playerY = -260;
+      state.walkFrame = 0;
+      state.mode = 'message';
+    }
+  } else if (state.mode === 'walk') {
+    let moved = false;
+    if (state.dir === 'up') { state.playerY -= CONFIG.moveSpeed; moved = true; }
+    if (state.dir === 'down') { state.playerY += CONFIG.moveSpeed; moved = true; }
+    if (state.dir === 'left') { state.playerX -= CONFIG.moveSpeed; moved = true; }
+    if (state.dir === 'right') { state.playerX += CONFIG.moveSpeed; moved = true; }
+    state.playerX = Math.max(BOUNDS.minX, Math.min(BOUNDS.maxX, state.playerX));
+    state.playerY = Math.max(BOUNDS.minY, Math.min(BOUNDS.maxY, state.playerY));
+    if (moved) {
+      state.walkTimer++;
+      if (state.walkTimer >= 12) { state.walkTimer = 0; state.walkFrame = state.walkFrame === 1 ? 2 : 1; }
+    } else { state.walkFrame = 0; state.walkTimer = 0; }
+    checkRoomArea();
+  } else if (state.mode === 'fadeout') {
+    state.fadeAlpha = Math.min(1, state.fadeAlpha + 0.025);
+  } else if (state.mode === 'choiceReturn' && now >= state.choiceReturnAt) {
+    state.mode = 'walk';
+    state.currentDoorEvent = null;
+    state.highlightedDoor = null;
+    state.msgQueue = CONFIG.openingMessages.slice();
+    state.msgIndex = 0;
+  }
+}
+
+function draw() {
+  ctx.clearRect(0, 0, 1000, 1000);
+  let bg = 'bg1';
+  if (state.playerY >= CAMERA_THRESHOLD.step3Y && imageReady(imgs.bg3)) bg = 'bg3';
+  else if (state.playerY >= CAMERA_THRESHOLD.step2Y && imageReady(imgs.bg2)) bg = 'bg2';
+  drawImage(bg);
+
+  if (state.arrowsVisible) {
+    let arrow = 'arrowNeutral';
+    if (state.highlightedDoor === 'left') arrow = 'arrowLeft';
+    else if (state.highlightedDoor === 'center') arrow = 'arrowCenter';
+    else if (state.highlightedDoor === 'right') arrow = 'arrowRight';
+    drawImage(arrow);
+  }
+
+  const character = state.walkFrame === 1 ? 'charaWalk1' : state.walkFrame === 2 ? 'charaWalk2' : 'charaIdle';
+  drawImage(character, state.playerX, state.playerY, 1000, 1000);
+
+  if (state.mode === 'walk' || state.mode === 'entrance') {
+    let pad = 'padNeutral';
+    if (state.dir === 'up') pad = 'padUp';
+    else if (state.dir === 'down') pad = 'padDown';
+    else if (state.dir === 'left') pad = 'padLeft';
+    else if (state.dir === 'right') pad = 'padRight';
+    if (state.mode === 'walk') drawImage(pad);
+  }
+
+  if (state.mode === 'message' || state.mode === 'choice' || state.mode === 'choiceReturn') {
+    drawImage('window');
+    drawImage('tachie');
+    ctx.fillStyle = '#333333';
+    ctx.font = "bold 28px 'Hiragino Kaku Gothic ProN', sans-serif";
+    ctx.textBaseline = 'alphabetic';
+    const text = state.mode === 'choice' || state.mode === 'choiceReturn'
+      ? CONFIG.roomQuestion
+      : (state.msgQueue[state.msgIndex] || '');
+    ctx.fillText(text, 135, 650);
+  }
+
+  if (state.mode === 'choice' || state.mode === 'choiceReturn') {
+    drawImage('choiceBox');
+    ctx.fillStyle = '#333333';
+    ctx.font = "bold 28px 'Hiragino Kaku Gothic ProN', sans-serif";
+    ctx.fillText(state.selectedChoice === 0 ? '《' + CONFIG.choiceYesText + '》' : CONFIG.choiceYesText, 355, 280);
+    ctx.fillText(state.selectedChoice === 1 ? '《' + CONFIG.choiceNoText + '》' : CONFIG.choiceNoText, 355, 375);
+  }
+
+  if (state.fadeAlpha > 0) {
+    ctx.fillStyle = 'rgba(0, 0, 0, ' + state.fadeAlpha + ')';
+    ctx.fillRect(0, 0, 1000, 1000);
+  }
+}
+
+function loop(now) {
+  update(now);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
